@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+httpdocs/vendor/
+httpdocs/node_modules/
+httpdocs/storage/logs/*
+httpdocs/storage/framework/cache/*
+httpdocs/storage/framework/sessions/*
+httpdocs/storage/framework/views/*
+httpdocs/bootstrap/cache/*.php
+realtime-server/node_modules/
+*.log

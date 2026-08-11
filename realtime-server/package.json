@@ -1,0 +1,27 @@
+{
+  "name": "sanad-realtime-server",
+  "version": "1.0.0",
+  "description": "Realtime Socket.IO gateway for Sanad (chat, community, WebRTC signaling, notifications)",
+  "main": "server.js",
+  "scripts": {
+    "start": "NODE_ENV=production node server.js",
+    "dev": "NODE_ENV=development nodemon server.js"
+  },
+  "keywords": [
+    "socket.io",
+    "realtime",
+    "sanad"
+  ],
+  "author": "Sanad Team",
+  "license": "MIT",
+  "dependencies": {
+    "@socket.io/redis-adapter": "^8.2.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "redis": "^4.7.0",
+    "socket.io": "^4.7.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
