@@ -32,7 +32,7 @@ class AppServiceProvider extends ServiceProvider
         });
 
         RateLimiter::for('auth', function (Request $request) {
-            return Limit::perMinute(10)->by($request->ip());
+            return Limit::perMinute(60)->by($request->ip());
         });
 
         Event::listen(CommunityPostCreated::class, [BroadcastCommunityEventListener::class, 'handle']);

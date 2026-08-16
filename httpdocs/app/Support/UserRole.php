@@ -11,9 +11,16 @@ final class UserRole
         if (!$user) {
             return null;
         }
-        $spatie = $user->getRoleNames()->first();
-        if ($spatie) {
-            return (string) $spatie;
+        if (!empty($user->role)) {
+            return (string) $user->role;
+        }
+        try {
+            $spatie = $user->getRoleNames()->first();
+            if ($spatie) {
+                return (string) $spatie;
+            }
+        } catch (\Throwable $e) {
+            // users.role is the source of truth for API clients
         }
         return $user->role;
     }

@@ -5,17 +5,27 @@ use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Validation\Rule;
+use App\Support\UniqueIdentity;
 
 class ProfileController extends Controller
 {
+    public function show(Request $request)
+    {
+        return app(\App\Http\Controllers\Api\AuthController::class)->me($request);
+    }
+
     public function update(Request $request)
     {
         $user = $request->user();
         $data = $request->validate([
-            'name' => ['nullable', 'string', 'min:2', 'max:120'],
+            'name' => ['nullable', 'string', 'min:2', 'max:120', Rule::unique('users', 'name')->ignore($user->id)],
             'locale' => ['nullable', 'string', 'max:5'],
-            'phone' => ['nullable', 'string', 'max:20'],
+            'phone' => ['nullable', 'string', 'max:20', Rule::unique('users', 'phone')->ignore($user->id)],
             'gender' => ['nullable', 'string', 'in:male,female,other,prefer_not'],
+        ], [
+            'name.unique' => 'This name is already registered.',
+            'phone.unique' => 'This phone number is already registered.',
         ]);
 
         if (array_key_exists('locale', $data) && $data['locale'] !== null) {
@@ -24,6 +34,13 @@ class ProfileController extends Controller
                 return response()->json(['ok' => false, 'message' => 'invalid_locale'], 422);
             }
             $data['locale'] = $locale;
+        }
+
+        if (array_key_exists('name', $data) && is_string($data['name'])) {
+            $data['name'] = UniqueIdentity::normalizeName($data['name']);
+        }
+        if (array_key_exists('phone', $data) && is_string($data['phone'])) {
+            $data['phone'] = UniqueIdentity::normalizePhone($data['phone']);
         }
 
         if ($user->isPatientAccount()) {
@@ -42,7 +59,7 @@ class ProfileController extends Controller
                 'phone' => $user->publicPhone(),
                 'locale' => $user->locale,
                 'gender' => $user->gender,
-                'role' => $user->getRoleNames()->first() ?? $user->role,
+                'role' => $user->role ?: 'patient',
             ],
         ]);
     }

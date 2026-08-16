@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\User;
+use App\Support\UniqueIdentity;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
@@ -117,19 +118,29 @@ class SocialAuthService
             if (User::where('email', $safeEmail)->exists()) {
                 $safeEmail = $provider . '_' . Str::uuid() . '@sanad.local';
             }
+            $safeName = UniqueIdentity::normalizeName($name) ?: 'User';
+            if (UniqueIdentity::nameExists($safeName)) {
+                $safeName = $safeName.' '.Str::lower(Str::random(4));
+            }
             $user = User::create([
-                'name' => $name,
+                'name' => $safeName,
                 'email' => $safeEmail,
                 'password' => Hash::make(Str::random(32)),
                 'role' => 'patient',
                 $column => $providerId,
             ]);
-            $user->assignRole('patient');
+            try {
+                $user->assignRole('patient');
+            } catch (\Throwable $e) {
+            }
         }
 
-        $user->tokens()->where('name', $deviceName)->delete();
-        $token = $user->createToken($deviceName)->plainTextToken;
+        $newToken = $user->createToken($deviceName);
+        $keepId = $newToken->accessToken->id ?? null;
+        if ($keepId) {
+            $user->tokens()->where('name', $deviceName)->where('id', '!=', $keepId)->delete();
+        }
 
-        return ['user' => $user, 'token' => $token];
+        return ['user' => $user, 'token' => $newToken->plainTextToken];
     }
 }

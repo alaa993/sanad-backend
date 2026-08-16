@@ -6,6 +6,8 @@ use Illuminate\Support\Facades\Hash;
 use Illuminate\Validation\ValidationException;
 use App\Models\User;
 use App\Support\OrganizationResolver;
+use App\Support\UniqueIdentity;
+use App\Support\UserRole;
 use App\Services\AccountDeletionService;
 use App\Services\SmsService;
 use Illuminate\Support\Facades\DB;
@@ -40,12 +42,15 @@ class AuthController extends Controller {
             $sanitized[$optional] = ($value === '' || $value === null) ? null : $value;
         }
         if (isset($sanitized['name']) && is_string($sanitized['name'])) {
-            $sanitized['name'] = trim($sanitized['name']);
+            $sanitized['name'] = UniqueIdentity::normalizeName($sanitized['name']);
+        }
+        if (isset($sanitized['phone']) && is_string($sanitized['phone'])) {
+            $sanitized['phone'] = UniqueIdentity::normalizePhone($sanitized['phone']);
         }
         $req->merge($sanitized);
 
         $data = $req->validate([
-            'name'      => 'required|string|min:2|max:120',
+            'name'      => 'required|string|min:2|max:120|unique:users,name',
             'email'     => ($isPatient ? 'nullable' : 'required').'|email|max:190|unique:users,email',
             'password'  => 'required|string|min:6|max:120',
             'phone'     => 'nullable|string|max:20|unique:users,phone',
@@ -56,6 +61,7 @@ class AuthController extends Controller {
             'password.min' => 'Password must be at least 6 characters (lowercase letters are allowed).',
             'password.required' => 'Password is required.',
             'name.min' => 'Name must be at least 2 characters.',
+            'name.unique' => 'This name is already registered.',
             'email.unique' => 'This email is already registered.',
             'phone.unique' => 'This phone number is already registered.',
         ]);
@@ -69,7 +75,7 @@ class AuthController extends Controller {
             'name'     => $data['name'],
             'email'    => $data['email'] ?? null,
             'password' => Hash::make($data['password']),
-            'phone'    => $isPatient ? null : ($data['phone'] ?? null),
+            'phone'    => $data['phone'] ?? null,
             'locale'   => $data['locale'] ?? null,
             'timezone' => $data['timezone'] ?? null,
             'role'     => $role,
@@ -77,19 +83,9 @@ class AuthController extends Controller {
         if ($role === 'organization') {
             OrganizationResolver::provisionForUser($user);
         }
-        $token = $user->createToken($deviceName)->plainTextToken;
+        $this->syncSpatieRole($user, $role);
+        $token = $this->issueDeviceToken($user, $deviceName);
         $payload = $this->sessionPayload($user);
-
-        // Spatie role sync can wait — clients already use users.role.
-        dispatch(function () use ($user, $role) {
-            try {
-                if (method_exists($user, 'assignRole') && !$user->hasRole($role)) {
-                    $user->assignRole($role);
-                }
-            } catch (\Throwable $e) {
-                // ignore: column role is source of truth for mobile clients
-            }
-        })->afterResponse();
 
         return response()->json([
             'status' => 'success',
@@ -109,19 +105,8 @@ class AuthController extends Controller {
         if (!$user || !Hash::check($data['password'], $user->password)) {
             throw ValidationException::withMessages(['email' => ['Invalid credentials.']]);
         }
-        $newToken = $user->createToken($deviceName);
-        $token = $newToken->plainTextToken;
+        $token = $this->issueDeviceToken($user, $deviceName);
         $payload = $this->sessionPayload($user);
-
-        // Revoke prior tokens for this device after the response is sent.
-        $keepId = $newToken->accessToken->id ?? null;
-        dispatch(function () use ($user, $deviceName, $keepId) {
-            $q = $user->tokens()->where('name', $deviceName);
-            if ($keepId) {
-                $q->where('id', '!=', $keepId);
-            }
-            $q->delete();
-        })->afterResponse();
 
         return response()->json([
             'status' => 'success',
@@ -150,18 +135,23 @@ class AuthController extends Controller {
         if ((string) $data['code'] !== (string) $expected) {
             throw ValidationException::withMessages(['code' => ['Invalid verification code.']]);
         }
-        $user = User::where('phone', $data['phone'])->first();
+        $phone = UniqueIdentity::normalizePhone($data['phone']) ?? $data['phone'];
+        $user = User::where('phone', $phone)->first();
         if (!$user) {
+            $suffix = substr($phone, -4);
+            $name = UniqueIdentity::nameExists('Patient '.$suffix)
+                ? 'Patient '.$suffix.' '.Str::lower(Str::random(4))
+                : 'Patient '.$suffix;
             $user = User::create([
-                'name' => 'Patient ' . substr($data['phone'], -4),
-                'email' => 'phone_' . preg_replace('/\D+/', '', $data['phone']) . '@sanad.local',
+                'name' => $name,
+                'email' => 'phone_' . $phone . '@sanad.local',
                 'password' => Hash::make(Str::random(16)),
-                'phone' => $data['phone'],
+                'phone' => $phone,
                 'role' => 'patient',
             ]);
+            $this->syncSpatieRole($user, 'patient');
         }
-        $user->tokens()->where('name', $deviceName)->delete();
-        $token = $user->createToken($deviceName)->plainTextToken;
+        $token = $this->issueDeviceToken($user, $deviceName);
         Cache::forget($cacheKey);
         return response()->json([
             'status' => 'success',
@@ -222,11 +212,20 @@ class AuthController extends Controller {
 
     public function me(Request $req) {
         $u = $req->user();
-        $cacheKey = "auth:me:{$u->id}";
-        $payload = Cache::remember($cacheKey, 180, function () use ($u) {
-            return $this->payload($u);
-        });
-        return response()->json($payload);
+        if (!$u) {
+            return response()->json(['message' => 'Unauthenticated.'], 401);
+        }
+        try {
+            $payload = $this->payload($u);
+            Cache::put("auth:me:{$u->id}", $payload, 180);
+            return response()->json($payload);
+        } catch (\Throwable $e) {
+            \Log::error('auth.me_failed', [
+                'user_id' => $u->id,
+                'error' => $e->getMessage(),
+            ]);
+            return response()->json($this->safePayload($u));
+        }
     }
 
     private function approvalStatus(User $user): ?string
@@ -263,11 +262,18 @@ class AuthController extends Controller {
             return null;
         }
         if (str_contains($username, '@')) {
-            return User::where('email', $username)->first();
+            return User::whereRaw('LOWER(email) = ?', [strtolower($username)])->first();
         }
-        return User::where('phone', $username)->first()
-            ?? User::where('email', $username)->first()
-            ?? User::where('name', $username)->first();
+        $phone = UniqueIdentity::normalizePhone($username);
+        if ($phone) {
+            $byPhone = User::where('phone', $phone)->first()
+                ?? User::where('phone', $username)->first();
+            if ($byPhone) {
+                return $byPhone;
+            }
+        }
+        return User::whereRaw('LOWER(TRIM(name)) = ?', [mb_strtolower($username, 'UTF-8')])->first()
+            ?? User::where('email', $username)->first();
     }
 
     private function payload(User $user): array
@@ -278,31 +284,28 @@ class AuthController extends Controller {
     /** Lean user blob for login/register — avoids Spatie and heavy admin counts. */
     private function sessionPayload(User $user): array
     {
-        $role = $user->role ?: 'patient';
-        $payload = [
-            'id' => $user->id,
-            'name' => $user->name,
-            'email'=> $user->publicEmail(),
-            'phone'=> $user->publicPhone(),
-            'locale' => $user->locale,
-            'gender' => $user->gender,
-            'role' => $role,
-            'approval_status' => in_array($role, ['patient', 'admin'], true)
-                ? 'approved'
-                : $this->approvalStatus($user),
-            'organization_status' => $role === 'organization' ? $this->organizationStatus($user) : null,
-            'rejection_reason' => $role === 'specialist' ? $this->specialistReason($user) : null,
-            'org_rejection_reason' => $role === 'organization' ? $this->orgReason($user) : null,
-            'org_profile' => $role === 'organization' ? $this->orgProfile($user) : null,
-            'admin_profile' => null,
-        ];
+        try {
+            $payload = $this->buildPayload($user, true);
+        } catch (\Throwable $e) {
+            $payload = $this->safePayload($user);
+        }
         Cache::put("auth:me:{$user->id}", $payload, 180);
         return $payload;
     }
 
     public function publicPayload(User $user): array
     {
-        $role = $user->role ?: 'patient';
+        try {
+            return $this->buildPayload($user, false);
+        } catch (\Throwable $e) {
+            return $this->safePayload($user);
+        }
+    }
+
+    private function buildPayload(User $user, bool $lean): array
+    {
+        $role = UserRole::resolve($user) ?: ($user->role ?: 'patient');
+        $isPatientOrAdmin = in_array($role, ['patient', 'admin'], true);
         return [
             'id' => $user->id,
             'name' => $user->name,
@@ -311,13 +314,60 @@ class AuthController extends Controller {
             'locale' => $user->locale,
             'gender' => $user->gender,
             'role' => $role,
-            'approval_status' => $this->approvalStatus($user),
-            'organization_status' => $this->organizationStatus($user),
+            'approval_status' => ($lean && $isPatientOrAdmin)
+                ? 'approved'
+                : $this->approvalStatus($user),
+            'organization_status' => $role === 'organization' ? $this->organizationStatus($user) : null,
             'rejection_reason' => $role === 'specialist' ? $this->specialistReason($user) : null,
             'org_rejection_reason' => $role === 'organization' ? $this->orgReason($user) : null,
             'org_profile' => $role === 'organization' ? $this->orgProfile($user) : null,
-            'admin_profile' => $role === 'admin' ? $this->adminProfile() : null,
+            'admin_profile' => (!$lean && $role === 'admin') ? $this->adminProfile() : null,
         ];
+    }
+
+    private function safePayload(User $user): array
+    {
+        $role = $user->role ?: 'patient';
+        $email = $user->email;
+        if ($role === 'patient' || ($email && str_ends_with($email, '@sanad.local'))) {
+            $email = null;
+        }
+        return [
+            'id' => $user->id,
+            'name' => $user->name,
+            'email' => $email,
+            'phone' => $role === 'patient' ? null : $user->phone,
+            'locale' => $user->locale,
+            'gender' => $user->gender,
+            'role' => $role,
+            'approval_status' => 'approved',
+            'organization_status' => null,
+            'rejection_reason' => null,
+            'org_rejection_reason' => null,
+            'org_profile' => null,
+            'admin_profile' => null,
+        ];
+    }
+
+    private function issueDeviceToken(User $user, string $deviceName): string
+    {
+        $newToken = $user->createToken($deviceName);
+        $keepId = $newToken->accessToken->id ?? null;
+        if ($keepId) {
+            $user->tokens()->where('name', $deviceName)->where('id', '!=', $keepId)->delete();
+        }
+        return $newToken->plainTextToken;
+    }
+
+    private function syncSpatieRole(User $user, string $role): void
+    {
+        try {
+            if (method_exists($user, 'assignRole') && !$user->hasRole($role)) {
+                $user->assignRole($role);
+            }
+        } catch (\Throwable $e) {
+            // users.role is source of truth for mobile clients
+        }
     }
 
     private function orgProfile(User $user): ?array
@@ -329,20 +379,27 @@ class AuthController extends Controller {
             return null;
         }
         $org = DB::table('organizations')->where('id', $orgId)->first(['id','name','status','about','review_notes']);
-        $specialists = DB::table('organization_user')->where('organization_id', $orgId)->where('role','specialist')->count();
-        $members = DB::table('organization_user')->where('organization_id', $orgId)->count();
-        $beneficiaries = DB::table('organization_beneficiaries')->where('organization_id', $orgId)->count();
-        $wallet = DB::table('wallets')->where(['owner_type'=>'user','owner_id'=>$user->id])->value('points') ?? 0;
+        $specialists = 0;
+        $members = 0;
+        $beneficiaries = 0;
+        $wallet = 0;
+        try {
+            $specialists = DB::table('organization_user')->where('organization_id', $orgId)->where('role','specialist')->count();
+            $members = DB::table('organization_user')->where('organization_id', $orgId)->count();
+            $beneficiaries = DB::table('organization_beneficiaries')->where('organization_id', $orgId)->count();
+            $wallet = DB::table('wallets')->where(['owner_type'=>'user','owner_id'=>$user->id])->value('points') ?? 0;
+        } catch (\Throwable $e) {
+        }
         return [
-            'id' => $org->id ?? $orgId,
-            'name' => $org->name ?? $user->name,
-            'status' => $org->status ?? 'pending',
-            'review_notes' => $org->review_notes ?? null,
+            'id' => $org?->id ?? $orgId,
+            'name' => $org?->name ?? $user->name,
+            'status' => $org?->status ?? 'pending',
+            'review_notes' => $org?->review_notes ?? null,
             'members' => $members,
             'specialists' => $specialists,
             'beneficiaries' => $beneficiaries,
             'wallet_points' => (int) $wallet,
-            'about' => $org->about ?? null,
+            'about' => $org?->about ?? null,
         ];
         });
     }
@@ -455,9 +512,6 @@ class AuthController extends Controller {
 
     private function findUserByUsername(string $username): ?User
     {
-        return User::where('email', $username)
-            ->orWhere('phone', $username)
-            ->orWhere('name', $username)
-            ->first();
+        return $this->findUserByIdentifier($username);
     }
 }

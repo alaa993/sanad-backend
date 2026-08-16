@@ -2,6 +2,7 @@
 
 namespace App\Http\Middleware;
 
+use App\Support\UserRole;
 use Closure;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
@@ -12,7 +13,8 @@ class AdminSuper
     {
         $user = $request->user();
         // If not authenticated as admin, block access
-        if (!$user || strcasecmp($user->role ?? '', 'admin') !== 0) {
+        $role = UserRole::resolve($user);
+        if (!$user || strcasecmp($role ?? '', 'admin') !== 0) {
             return response()->json(['message' => 'Forbidden'], 403);
         }
 

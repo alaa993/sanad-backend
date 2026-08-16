@@ -36,7 +36,14 @@ class User extends Authenticatable {
 
     public function isPatientAccount(): bool
     {
-        $role = $this->getRoleNames()->first() ?? $this->role;
+        $role = $this->role;
+        if (!$role) {
+            try {
+                $role = $this->getRoleNames()->first();
+            } catch (\Throwable $e) {
+                $role = 'patient';
+            }
+        }
 
         return $role === 'patient' || empty($role);
     }

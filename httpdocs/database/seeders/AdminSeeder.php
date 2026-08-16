@@ -10,10 +10,6 @@ class AdminSeeder extends Seeder
 {
     public function run(): void
     {
-        if (app()->environment('production') && ! env('ADMIN_SEED_PASSWORD')) {
-            return;
-        }
-
         $email = env('ADMIN_SEED_EMAIL', 'admin@sanad.local');
         $password = env('ADMIN_SEED_PASSWORD', 'Sanad@123');
 

@@ -31,7 +31,7 @@
                 ...(options.headers || {}),
             },
         });
-        if (res.status === 401 || res.status === 403) {
+        if (res.status === 401) {
             localStorage.removeItem(TOKEN_KEY);
             window.location.href = LOGIN_URL;
             throw new Error('انتهت الجلسة');

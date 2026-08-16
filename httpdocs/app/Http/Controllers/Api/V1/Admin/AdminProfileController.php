@@ -32,9 +32,12 @@ class AdminProfileController extends Controller
     {
         $user = $request->user();
         $data = $request->validate([
-            'name' => ['nullable','string','min:2'],
+            'name' => ['nullable','string','min:2','max:120','unique:users,name,'.$user->id],
             'locale' => ['nullable','string','max:5'],
-            'phone' => ['nullable','string','max:20'],
+            'phone' => ['nullable','string','max:20','unique:users,phone,'.$user->id],
+        ], [
+            'name.unique' => 'This name is already registered.',
+            'phone.unique' => 'This phone number is already registered.',
         ]);
         $user->update(array_filter($data, fn($v) => !is_null($v)));
         Cache::forget('admin:profile:stats');

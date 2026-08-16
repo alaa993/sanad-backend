@@ -57,26 +57,28 @@ use App\Http\Controllers\Api\V1\Organization\{
     OrganizationBillingController
 };
 
-Route::prefix('auth')->middleware('throttle:auth')->group(function () {
-    Route::post('register', [AuthController::class, 'register']);
-    Route::post('login',    [AuthController::class, 'login']);
-    Route::post('phone/request-otp', [AuthController::class, 'phoneRequestOtp']);
-    Route::post('phone/login', [AuthController::class, 'phoneLogin']);
-    Route::post('google', [SocialAuthController::class, 'google']);
-    Route::post('apple', [SocialAuthController::class, 'apple']);
-    Route::post('facebook', [SocialAuthController::class, 'facebook']);
-    Route::post('security-answer', [AuthController::class, 'saveSecurityAnswer']);
-    Route::post('forgot/lookup', [AuthController::class, 'forgotLookup']);
-    Route::post('forgot/reset', [AuthController::class, 'resetPasswordWithAnswer']);
-    Route::post('forgot-password', function (Request $r) {
-        $r->validate(['email' => 'required|email']);
-        $status = Password::sendResetLink($r->only('email'));
-        return $status === Password::RESET_LINK_SENT
-            ? response()->json(['sent' => true])
-            : response()->json(['sent' => false], 422);
+Route::prefix('auth')->group(function () {
+    Route::middleware('throttle:auth')->group(function () {
+        Route::post('register', [AuthController::class, 'register']);
+        Route::post('login',    [AuthController::class, 'login']);
+        Route::post('phone/request-otp', [AuthController::class, 'phoneRequestOtp']);
+        Route::post('phone/login', [AuthController::class, 'phoneLogin']);
+        Route::post('google', [SocialAuthController::class, 'google']);
+        Route::post('apple', [SocialAuthController::class, 'apple']);
+        Route::post('facebook', [SocialAuthController::class, 'facebook']);
+        Route::post('security-answer', [AuthController::class, 'saveSecurityAnswer']);
+        Route::post('forgot/lookup', [AuthController::class, 'forgotLookup']);
+        Route::post('forgot/reset', [AuthController::class, 'resetPasswordWithAnswer']);
+        Route::post('forgot-password', function (Request $r) {
+            $r->validate(['email' => 'required|email']);
+            $status = Password::sendResetLink($r->only('email'));
+            return $status === Password::RESET_LINK_SENT
+                ? response()->json(['sent' => true])
+                : response()->json(['sent' => false], 422);
+        });
     });
 
-    Route::middleware('auth:sanctum')->group(function () {
+    Route::middleware(['auth:sanctum', 'throttle:api'])->group(function () {
         Route::post('logout', [AuthController::class, 'logout']);
         Route::get('me', [AuthController::class, 'me']);
         Route::delete('account', [AuthController::class, 'deleteAccount']);
@@ -92,6 +94,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\ForceJson::class, 'throt
     Route::get('push-preferences', [PushDeviceController::class, 'preferences']);
     Route::put('push-preferences', [PushDeviceController::class, 'updatePreferences']);
     Route::get('settings', [SettingsController::class, 'show']);
+    Route::get('profile', [ProfileController::class, 'show']);
     Route::put('profile', [ProfileController::class, 'update']);
     Route::post('profile/password', [ProfileController::class, 'updatePassword']);
 
