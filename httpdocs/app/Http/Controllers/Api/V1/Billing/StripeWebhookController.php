@@ -10,6 +10,10 @@ use Stripe\Webhook;
 class StripeWebhookController extends Controller {
   public function handle(Request $r){
     $secret = config('stripe.webhook_secret');
+    if (!$secret) {
+      Log::error('stripe_webhook_secret_missing');
+      return response()->json(['ok' => false], 503);
+    }
     $sig = $r->header('Stripe-Signature');
     $payload = $r->getContent();
     try {

@@ -22,12 +22,10 @@ class User extends Authenticatable {
         'apple_id',
         'facebook_id',
         'push_enabled',
-        'points',
         'extra',
         'security_question',
-        'security_answer_hash',
     ];
-    protected $hidden   = ['password','remember_token'];
+    protected $hidden   = ['password','remember_token','security_answer_hash','google_id','apple_id','facebook_id'];
 
     public function specialistDocuments()
     {

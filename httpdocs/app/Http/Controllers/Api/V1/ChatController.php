@@ -41,10 +41,21 @@ class ChatController extends Controller {
     }
 
     public function store(Request $req){
-        $data = $req->validate([ 'participant_ids'=>'required|array|min:1', 'subject'=>'nullable|string|max:255' ]);
+        $data = $req->validate([
+            'participant_ids' => 'required|array|min:1|max:10',
+            'participant_ids.*' => 'integer|exists:users,id',
+            'subject' => 'nullable|string|max:255',
+        ]);
         $user = $req->user();
         $chat = Chat::create(['subject'=>$data['subject'] ?? null]);
         $ids = array_unique(array_map('intval', $data['participant_ids']));
+        $ids = \App\Models\User::query()
+            ->whereIn('id', $ids)
+            ->where(function ($q) {
+                $q->whereNull('role')->orWhere('role', '!=', 'admin');
+            })
+            ->pluck('id')
+            ->all();
         $participants = array_values(array_unique(array_merge([$user->id], $ids)));
         foreach($participants as $uid){
             ChatParticipant::create([
@@ -95,7 +106,7 @@ class ChatController extends Controller {
      */
     public function send(Request $req, Chat $chat){
         $this->authorizeView($req->user(), $chat->id);
-        $data = $req->validate([ 'type'=>'required|in:text,image', 'body'=>'required|string' ]);
+        $data = $req->validate([ 'type'=>'required|in:text,image', 'body'=>'required|string|max:4000' ]);
 
         // حماية زمن الجلسة: إذا كان الشات مرتبطاً بموعد وانتهى وقته أو أُغلق، امنع الإرسال
         $appointment = \App\Models\Appointment::where('chat_id', $chat->id)->first();

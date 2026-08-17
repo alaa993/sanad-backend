@@ -148,9 +148,10 @@ class LibraryController extends Controller
         }
 
         $user = $request->user();
-        $active = array_key_exists('active', $data)
-            ? (bool) $data['active']
-            : (bool) ($data['published'] ?? true);
+        $isAdmin = $role === 'admin';
+        $active = $isAdmin
+            ? (array_key_exists('active', $data) ? (bool) $data['active'] : (bool) ($data['published'] ?? true))
+            : false;
 
         $article = LibraryArticle::create([
             'category_id' => $categoryId,

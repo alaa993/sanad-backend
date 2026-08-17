@@ -200,7 +200,7 @@ class SessionController extends Controller
         }
         $end   = $start->copy()->addMinutes(config('appointments.default_duration_minutes', 60));
 
-        $cost = (int) ($data['points_cost'] ?? 0);
+        $cost = (int) config('sanad.session_price_points', 100);
         $appointment = null;
         try {
             DB::transaction(function () use ($user, $data, $start, $end, $cost, &$appointment) {
@@ -310,9 +310,9 @@ class SessionController extends Controller
             'join_url'     => ['nullable', 'string'],
             'rating'       => ['nullable', 'integer', 'min:1', 'max:5'],
             'specialist_notes' => ['nullable', 'string'],
-            'points_cost'  => ['nullable', 'integer', 'min:0'],
             'rejection_reason' => ['nullable', 'string', 'max:500'],
         ]);
+        unset($data['points_cost']);
 
         if (isset($data['scheduled_at'])) {
             $start = $this->parseSchedule($data['scheduled_at'], $request);

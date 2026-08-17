@@ -17,6 +17,7 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const SOCKET_PATH = process.env.SOCKET_PATH || '/socket/';
 const AUTH_TOKEN = process.env.REALTIME_SOCKET_TOKEN || process.env.SOCKET_AUTH_TOKEN || '';
+const AUTH_VERIFY_URL = process.env.AUTH_VERIFY_URL || process.env.LARAVEL_AUTH_ME_URL || '';
 const ALLOWED_ORIGINS = (process.env.SOCKET_ALLOWED_ORIGINS || '')
   .split(',')
   .map((o) => o.trim())
@@ -168,11 +169,14 @@ function broadcastServerEvent(event, payload = {}) {
 }
 
 app.post('/internal/emit', (req, res) => {
+  if (!AUTH_TOKEN) {
+    return res.status(503).json({ ok: false, error: 'realtime_token_not_configured' });
+  }
   const headerToken = req.headers['x-realtime-token'] || req.headers['authorization'];
   const token = String(headerToken || '')
     .replace(/^Bearer\s+/i, '')
     .trim();
-  if (AUTH_TOKEN && token !== AUTH_TOKEN) {
+  if (token !== AUTH_TOKEN) {
     return res.status(403).json({ ok: false, error: 'forbidden' });
   }
   const { event, payload } = req.body || {};
@@ -217,8 +221,24 @@ const io = new Server(server, {
   console.error('[Realtime] Failed to connect to Redis adapter', err);
 });
 
-/** Auth middleware: require userId; system sockets need REALTIME token; app tokens must be non-trivial when AUTH_TOKEN is set. */
-io.use((socket, next) => {
+const ROOM_PATTERN = /^(chat|session|community|group|post|private_chat)_[A-Za-z0-9_-]{1,64}$/;
+const SAFE_ROLES = new Set(['patient', 'specialist', 'organization']);
+
+function isAllowedRoom(userId, role, room) {
+  if (!room || typeof room !== 'string' || room.length > 80) return false;
+  if (room === `user_${userId}`) return true;
+  if (SAFE_ROLES.has(role) && room === `role_${role}`) return true;
+  return ROOM_PATTERN.test(room);
+}
+
+function joinAllowed(socket, userId, role, room) {
+  if (!isAllowedRoom(userId, role, room)) return false;
+  socket.join(room);
+  return true;
+}
+
+/** Auth middleware: require userId; system sockets need REALTIME token; app clients need a non-trivial token. */
+io.use(async (socket, next) => {
   const { token, userId, role } = handshakeContext(socket);
 
   if (!userId) {
@@ -226,16 +246,48 @@ io.use((socket, next) => {
   }
 
   if (userId === 'system' && role === 'system') {
-    if (!AUTH_TOKEN || token === AUTH_TOKEN) {
+    if (AUTH_TOKEN && token === AUTH_TOKEN) {
+      socket.data.userId = userId;
+      socket.data.role = 'system';
       return next();
     }
     return next(new Error('invalid_system_token'));
   }
 
-  if (AUTH_TOKEN && token.length < 10) {
+  if (!token || token.length < 16) {
     return next(new Error('missing_app_token'));
   }
 
+  if (AUTH_VERIFY_URL) {
+    try {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 4000);
+      const res = await fetch(AUTH_VERIFY_URL, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json',
+        },
+        signal: ac.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) {
+        return next(new Error('invalid_app_token'));
+      }
+      const body = await res.json();
+      const verifiedId = body.user?.id ?? body.id ?? body.data?.id;
+      if (verifiedId == null || String(verifiedId) !== String(userId)) {
+        return next(new Error('user_mismatch'));
+      }
+      socket.data.userId = String(verifiedId);
+      socket.data.role = String(body.user?.role ?? body.role ?? role ?? 'patient');
+      return next();
+    } catch (err) {
+      return next(new Error('auth_verify_failed'));
+    }
+  }
+
+  socket.data.userId = String(userId);
+  socket.data.role = SAFE_ROLES.has(role) ? role : 'guest';
   return next();
 });
 
@@ -301,34 +353,32 @@ function buildPrivateRoom(userA, userB) {
 // --- Connection Handler -----------------------------------------------------
 io.on('connection', (socket) => {
   const ctx = handshakeContext(socket);
-  const userId = ctx.userId || `guest_${socket.id}`;
-  const role = ctx.role || 'guest';
-  const auth = ctx.auth;
+  const userId = socket.data.userId || ctx.userId;
+  const role = socket.data.role || (SAFE_ROLES.has(ctx.role) ? ctx.role : 'guest');
 
   console.log(`[Realtime] ${socket.id} connected as ${userId} (${role})`);
   registerPresence(userId, role, socket.id);
   emitPresence(userId);
 
   socket.join(`user_${userId}`);
-  socket.join(`role_${role}`);
-
-  const autoRooms = Array.isArray(auth.rooms) ? auth.rooms : [];
-  autoRooms.forEach((room) => socket.join(room));
+  if (SAFE_ROLES.has(role)) {
+    socket.join(`role_${role}`);
+  }
 
   socket.emit('socket:ready', { socketId: socket.id, userId, role });
 
   // Clients join chat_/session_/community_ rooms after REST loads; ack returns the rooms joined.
   socket.on('join', ({ room, rooms = [], meta = {} } = {}, ack) => {
-    const joining = [];
-    if (room) joining.push(room);
-    joining.push(...rooms);
-    joining
-      .filter(Boolean)
-      .forEach((r) => {
-        socket.join(r);
-        console.log(`[Realtime] ${userId} joined ${r}`);
-      });
-    ack?.({ ok: true, joined: joining, meta });
+    const requested = [];
+    if (room) requested.push(room);
+    requested.push(...rooms);
+    const joined = [];
+    requested.filter(Boolean).forEach((r) => {
+      if (joinAllowed(socket, userId, role, r)) {
+        joined.push(r);
+      }
+    });
+    ack?.({ ok: true, joined, meta });
   });
 
   socket.on('leave', ({ room } = {}, ack) => {
@@ -343,20 +393,25 @@ io.on('connection', (socket) => {
   // Private chat -------------------------------------------------------------
   socket.on('chat:typing', (payload = {}) => {
     const room = payload.room || buildPrivateRoom(userId, payload.to);
+    if (!isAllowedRoom(userId, role, room)) return;
     io.to(room).except(`user_${userId}`).emit('chat:typing', { ...payload, room, userId });
   });
 
   socket.on('chat:message', (payload = {}, ack) => {
     const timestamp = Date.now();
     const room = resolveRoom(payload) || buildPrivateRoom(userId, payload.to);
+    if (!isAllowedRoom(userId, role, room)) {
+      ack?.({ ok: false, error: 'forbidden_room' });
+      return;
+    }
     const message = {
       id: payload.id || `${room}_${timestamp}`,
       room,
       from: userId,
       to: payload.to,
       type: payload.type || 'text',
-      content: payload.content ?? payload.body,
-      attachments: payload.attachments || [],
+      content: typeof payload.content === 'string' ? payload.content.slice(0, 4000) : (payload.body ?? ''),
+      attachments: Array.isArray(payload.attachments) ? payload.attachments.slice(0, 5) : [],
       createdAt: timestamp,
       meta: payload.meta || {},
     };
@@ -378,7 +433,7 @@ io.on('connection', (socket) => {
   socket.on('group:join', ({ groupId }) => {
     if (!groupId) return;
     const room = `group_${groupId}`;
-    socket.join(room);
+    if (!joinAllowed(socket, userId, role, room)) return;
     const count = io.sockets.adapter.rooms.get(room)?.size ?? 0;
     io.to(room).emit('group:presence', { groupId, userId, action: 'join', count, at: Date.now() });
   });
@@ -394,6 +449,7 @@ io.on('connection', (socket) => {
   socket.on('group:message', ({ groupId, content, attachments = [], meta = {} } = {}) => {
     if (!groupId) return;
     const room = `group_${groupId}`;
+    if (!isAllowedRoom(userId, role, room)) return;
     const payload = {
       id: `${room}_${Date.now()}`,
       groupId,
@@ -407,57 +463,31 @@ io.on('connection', (socket) => {
   });
 
   socket.on('presence:status', ({ status }) => {
-    io.emit('presence:status', { userId, status, at: Date.now() });
+    io.to(`user_${userId}`).emit('presence:status', { userId, status, at: Date.now() });
   });
 
   // WebRTC Signaling ---------------------------------------------------------
   ['video:offer', 'video:answer', 'video:ice', 'call:start', 'call:end'].forEach((event) => {
     socket.on(event, (payload = {}) => {
       const room = payload.room || (payload.sessionId ? `session_${payload.sessionId}` : undefined);
-      if (!room) return;
+      if (!room || !isAllowedRoom(userId, role, room)) return;
       io.to(room).emit(event, { ...payload, from: userId, at: Date.now() });
     });
   });
 
   // Community feed -----------------------------------------------------------
-  socket.on('community:post', (payload = {}) => {
-    const eventPayload = { ...payload, authorId: userId, at: Date.now() };
-    if (COMMUNITY_GLOBAL_EVENTS) {
-      io.emit('community:post', eventPayload);
-    } else if (payload.id) {
-      io.to(`post_${payload.id}`).emit('community:post', eventPayload);
-    }
-  });
+  socket.on('community:post', () => {});
+  socket.on('community:comment', () => {});
+  socket.on('community:like', () => {});
 
-  socket.on('community:comment', (payload = {}) => {
-    const eventPayload = { ...payload, authorId: userId, at: Date.now() };
-    if (COMMUNITY_GLOBAL_EVENTS) {
-      io.emit('community:comment', eventPayload);
-    } else if (payload.postId) {
-      io.to(`post_${payload.postId}`).emit('community:comment', eventPayload);
-    }
-  });
-
-  socket.on('community:like', (payload = {}) => {
-    const eventPayload = { ...payload, userId, at: Date.now() };
-    if (COMMUNITY_GLOBAL_EVENTS) {
-      io.emit('community:like', eventPayload);
-    } else if (payload.postId) {
-      io.to(`post_${payload.postId}`).emit('community:like', eventPayload);
-    }
-  });
-
-  // Notifications ------------------------------------------------------------
-  socket.on('notify:event', ({ targetUserId, type, data = {} } = {}) => {
-    if (!targetUserId) return;
-    io.to(`user_${targetUserId}`).emit('notify:event', { type, data, from: userId, at: Date.now() });
-  });
+  // Notifications are server-originated via /internal/emit.
+  socket.on('notify:event', () => {});
 
   // Session rooms ------------------------------------------------------------
   socket.on('session:join', ({ sessionId }) => {
     if (!sessionId) return;
     const room = `session_${sessionId}`;
-    socket.join(room);
+    if (!joinAllowed(socket, userId, role, room)) return;
     io.to(room).emit('session:presence', { sessionId, userId, action: 'join', at: Date.now() });
   });
 
@@ -470,14 +500,13 @@ io.on('connection', (socket) => {
 
   socket.on('session:status', ({ sessionId, status, meta = {} } = {}) => {
     if (!sessionId) return;
-    io.to(`session_${sessionId}`).emit('session:status', { sessionId, status, meta, by: userId, at: Date.now() });
+    const room = `session_${sessionId}`;
+    if (!isAllowedRoom(userId, role, room)) return;
+    io.to(room).emit('session:status', { sessionId, status, meta, by: userId, at: Date.now() });
   });
 
-  // Role-based broadcasts ----------------------------------------------------
-  socket.on('role:event', ({ role: targetRole, type, data = {} } = {}) => {
-    if (!targetRole) return;
-    io.to(`role_${targetRole}`).emit('role:event', { type, data, from: userId, at: Date.now() });
-  });
+  // Role-based broadcasts are server-originated only.
+  socket.on('role:event', () => {});
 
   // Cleanup ------------------------------------------------------------------
   socket.on('disconnect', () => {
@@ -492,6 +521,11 @@ server.listen(PORT, HOST, () => {
   if (AUTH_TOKEN) {
     console.log('[Realtime] Auth token enforcement enabled.');
   } else {
-    console.warn('[Realtime] WARNING: REALTIME_SOCKET_TOKEN not set — system emit endpoint is open.');
+    console.warn('[Realtime] WARNING: REALTIME_SOCKET_TOKEN not set — /internal/emit is disabled.');
+  }
+  if (AUTH_VERIFY_URL) {
+    console.log('[Realtime] Sanctum token verification enabled.');
+  } else {
+    console.warn('[Realtime] WARNING: AUTH_VERIFY_URL not set — socket identity is not verified against Laravel.');
   }
 });

@@ -11,7 +11,14 @@ class AdminSeeder extends Seeder
     public function run(): void
     {
         $email = env('ADMIN_SEED_EMAIL', 'admin@sanad.local');
-        $password = env('ADMIN_SEED_PASSWORD', 'Sanad@123');
+        $password = env('ADMIN_SEED_PASSWORD');
+        if (!$password) {
+            if (app()->environment('production')) {
+                $this->command?->warn('Skipping admin seed: set ADMIN_SEED_PASSWORD.');
+                return;
+            }
+            $password = 'Sanad@123';
+        }
 
         $admin = User::firstOrCreate(
             ['email' => $email],

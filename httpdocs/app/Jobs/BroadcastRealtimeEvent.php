@@ -85,7 +85,10 @@ class BroadcastRealtimeEvent implements ShouldQueue
 
         try {
             $engine = new Version4X($endpoint, [
-                'context' => ['ssl' => ['verify_peer' => false, 'verify_peer_name' => false]],
+                'context' => ['ssl' => [
+                    'verify_peer' => !app()->environment('local'),
+                    'verify_peer_name' => !app()->environment('local'),
+                ]],
                 'query' => [
                     'userId' => 'system',
                     'role' => 'system',

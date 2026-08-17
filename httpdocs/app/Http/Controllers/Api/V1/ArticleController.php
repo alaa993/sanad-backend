@@ -10,8 +10,14 @@ class ArticleController extends Controller {
     });
     return response()->json($payload); }
   public function show(Request $r,$id){ $cacheKey = "articles:show:{$id}";
-    $payload = Cache::remember($cacheKey, 120, function () use ($id) {
-        $a=Article::findOrFail($id); return ['data'=>$a];
+    $payload = Cache::remember($cacheKey, 120, function () use ($id, $r) {
+        $a=Article::findOrFail($id);
+        $user = $r->user();
+        $canSeeDraft = $user && ($user->role === 'admin' || (int) $a->author_id === (int) $user->id);
+        if (!$a->published && !$canSeeDraft) {
+            abort(404);
+        }
+        return ['data'=>$a];
     });
     return response()->json($payload); }
   public function favorite(Request $r,$id){ ArticleFavorite::firstOrCreate(['article_id'=>$id,'user_id'=>$r->user()->id]); return response()->json(['favorited'=>true]); }
@@ -29,11 +35,12 @@ class ArticleController extends Controller {
         'tags' => 'nullable|array',
         'published' => 'nullable|boolean',
     ]);
-    $article = Article::create($data + [
+    $published = ($user->role === 'admin') ? (bool) ($data['published'] ?? false) : false;
+    $article = Article::create(array_merge($data, [
         'author_id' => $user->id,
         'author_role' => $user->role,
-        'published' => $data['published'] ?? false,
-    ]);
+        'published' => $published,
+    ]));
     Cache::forget('articles:list:' . md5(''));
     return response()->json(['data'=>$article], 201);
   }
@@ -52,6 +59,10 @@ class ArticleController extends Controller {
         'published' => 'nullable|boolean',
     ]);
     $article->update(array_filter($data, fn($v) => !is_null($v)));
+    if ($user->role !== 'admin') {
+        $article->published = false;
+        $article->save();
+    }
     Cache::forget("articles:show:{$id}");
     Cache::forget('articles:list:' . md5(''));
     return response()->json(['data'=>$article->fresh()]);

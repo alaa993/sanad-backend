@@ -30,6 +30,9 @@ class AuthController extends Controller {
             ?? $req->userAgent()
             ?? 'mobile';
         $role = $req->input('role', 'patient');
+        if (!in_array($role, ['patient', 'specialist', 'organization'], true)) {
+            $role = 'patient';
+        }
         $isPatient = $role === 'patient';
 
         // حقول اختيارية فارغة يجب أن تصبح null حتى لا تفشل قواعد unique/email على "".
@@ -56,7 +59,7 @@ class AuthController extends Controller {
             'phone'     => 'nullable|string|max:20|unique:users,phone',
             'locale'    => 'nullable|string|max:5',
             'timezone'  => 'nullable|string|max:64',
-            'role'      => 'nullable|string|in:patient,specialist,organization,admin'
+            'role'      => 'nullable|string|in:patient,specialist,organization'
         ], [
             'password.min' => 'Password must be at least 6 characters (lowercase letters are allowed).',
             'password.required' => 'Password is required.',
@@ -129,7 +132,7 @@ class AuthController extends Controller {
             ?? 'mobile';
         $cacheKey = 'phone_otp:' . preg_replace('/\D+/', '', $data['phone']);
         $expected = Cache::get($cacheKey);
-        if (!$expected && config('app.debug')) {
+        if (!$expected && app()->environment('local')) {
             $expected = '000000';
         }
         if ((string) $data['code'] !== (string) $expected) {
@@ -171,7 +174,7 @@ class AuthController extends Controller {
         $sent = $sms->sendOtp($data['phone'], $code, $req->header('Accept-Language'));
         return response()->json([
             'sent' => $sent,
-            'debug_code' => config('app.debug') ? $code : null,
+            'debug_code' => app()->environment('local') ? $code : null,
         ]);
     }
 
@@ -441,12 +444,12 @@ class AuthController extends Controller {
     public function saveSecurityAnswer(Request $req)
     {
         $data = $req->validate([
-            'username' => 'required|string',
-            'security_answer' => 'required|string|min:1',
+            'security_answer' => 'required|string|min:1|max:120',
+            'username' => 'nullable|string',
         ]);
-        $user = $this->findUserByUsername($data['username']);
+        $user = $req->user();
         if (!$user) {
-            return response()->json(['ok' => false, 'message' => 'user_not_found'], 404);
+            return response()->json(['ok' => false, 'message' => 'unauthenticated'], 401);
         }
         $user->security_question = self::SECURITY_QUESTION;
         $user->security_answer_hash = Hash::make($data['security_answer']);
@@ -456,17 +459,11 @@ class AuthController extends Controller {
 
     public function forgotLookup(Request $req)
     {
-        $data = $req->validate(['username' => 'required|string']);
-        $user = $this->findUserByUsername($data['username']);
-        if (!$user) {
-            return response()->json(['exists' => false, 'message' => 'user_not_found'], 404);
-        }
+        $req->validate(['username' => 'required|string']);
         return response()->json([
             'exists' => true,
-            'name' => $user->name,
-            'account_hint' => $this->accountHint($user),
-            'security_question' => $user->security_question ?: self::SECURITY_QUESTION,
-            'has_security_answer' => !empty($user->security_answer_hash),
+            'security_question' => self::SECURITY_QUESTION,
+            'has_security_answer' => true,
         ]);
     }
 
@@ -477,18 +474,24 @@ class AuthController extends Controller {
             'security_answer' => 'required|string|min:1',
             'new_password' => 'required|string|min:6|confirmed',
         ]);
+        $lockKey = 'forgot_reset:' . strtolower($data['username']) . ':' . $req->ip();
+        $fails = (int) Cache::get($lockKey, 0);
+        if ($fails >= 5) {
+            return response()->json(['ok' => false, 'message' => 'too_many_attempts'], 429);
+        }
         $user = $this->findUserByUsername($data['username']);
         if (!$user) {
-            return response()->json(['ok' => false, 'message' => 'user_not_found'], 404);
-        }
-        if (empty($user->security_answer_hash)) {
-            return response()->json(['ok' => false, 'message' => 'security_answer_not_set'], 422);
-        }
-        if (!Hash::check($data['security_answer'], $user->security_answer_hash)) {
+            Cache::put($lockKey, $fails + 1, now()->addMinutes(15));
             return response()->json(['ok' => false, 'message' => 'invalid_security_answer'], 422);
         }
+        if (empty($user->security_answer_hash) || !Hash::check($data['security_answer'], $user->security_answer_hash)) {
+            Cache::put($lockKey, $fails + 1, now()->addMinutes(15));
+            return response()->json(['ok' => false, 'message' => 'invalid_security_answer'], 422);
+        }
+        Cache::forget($lockKey);
         $user->password = Hash::make($data['new_password']);
         $user->save();
+        $user->tokens()->delete();
         return response()->json(['ok' => true]);
     }
 
